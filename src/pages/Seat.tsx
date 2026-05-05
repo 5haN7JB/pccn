@@ -1,41 +1,120 @@
-import { useMemo, useState } from "react";
-import { useParams } from "react-router-dom";
+import { useEffect, useMemo, useState } from "react";
+import { useParams, useNavigate } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { supabase } from "@/lib/supabase";
 
 type MenuItem = { id: string; name: string; price: number };
 
-const MENU: MenuItem[] = [
-  { id: "ccn-plain", name: "Chur Chur Naan Plain", price: 80 },
-  { id: "ccn-aloo", name: "Chur Chur Naan Aloo", price: 100 },
-  { id: "ccn-paneer", name: "Chur Chur Naan Paneer", price: 120 },
-  { id: "ccn-mixed", name: "Chur Chur Naan Mixed (Aloo + Paneer)", price: 130 },
-];
-
-type Step = "welcome" | "menu" | "confirmed";
+type Step = "welcome" | "menu";
 
 const Seat = () => {
   const { seatId } = useParams();
+  const navigate = useNavigate();
+
   const [step, setStep] = useState<Step>("welcome");
   const [name, setName] = useState("");
   const [qty, setQty] = useState<Record<string, number>>({});
-  const [orderId] = useState(
-    () => `PCCN-${String(Math.floor(Math.random() * 9000) + 1000)}`,
-  );
 
-  const items = useMemo(
+  const [menu, setMenu] = useState<MenuItem[]>([]);
+  const [menuLoading, setMenuLoading] = useState(true);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Fetch menu items from Supabase
+  useEffect(() => {
+    const fetchMenu = async () => {
+      setMenuLoading(true);
+      const { data, error: err } = await supabase
+        .from("menu_items")
+        .select("id, name, price")
+        .eq("available", true);
+
+      if (err) {
+        setError(err.message);
+      } else {
+        setMenu(data ?? []);
+      }
+      setMenuLoading(false);
+    };
+    fetchMenu();
+  }, []);
+
+  const cartItems = useMemo(
     () =>
-      MENU.map((m) => ({ ...m, qty: qty[m.id] ?? 0 })).filter((i) => i.qty > 0),
-    [qty],
+      menu.map((m) => ({ ...m, qty: qty[m.id] ?? 0 })).filter((i) => i.qty > 0),
+    [qty, menu],
   );
-  const totalCount = items.reduce((s, i) => s + i.qty, 0);
-  const totalAmount = items.reduce((s, i) => s + i.qty * i.price, 0);
+  const totalCount = cartItems.reduce((s, i) => s + i.qty, 0);
+  const totalAmount = cartItems.reduce((s, i) => s + i.qty * i.price, 0);
 
   const inc = (id: string) =>
     setQty((q) => ({ ...q, [id]: (q[id] ?? 0) + 1 }));
   const dec = (id: string) =>
     setQty((q) => ({ ...q, [id]: Math.max(0, (q[id] ?? 0) - 1) }));
 
+  const placeOrder = async () => {
+    if (submitting || cartItems.length === 0) return;
+    setSubmitting(true);
+    setError(null);
+
+    try {
+      // 1. Look up seat id from seats table
+      const { data: seatRow, error: seatErr } = await supabase
+        .from("seats")
+        .select("id")
+        .eq("seat_number", Number(seatId))
+        .single();
+
+      if (seatErr || !seatRow) {
+        throw new Error(seatErr?.message ?? "Seat not found");
+      }
+
+      // 2. Generate order code
+      const orderCode = `PCCN-${String(Math.floor(Math.random() * 9000) + 1000)}`;
+
+      // 3. Insert into orders
+      const { data: orderRow, error: orderErr } = await supabase
+        .from("orders")
+        .insert({
+          order_code: orderCode,
+          customer_name: name.trim(),
+          seat_id: seatRow.id,
+          status: "new",
+        })
+        .select("id")
+        .single();
+
+      if (orderErr || !orderRow) {
+        throw new Error(orderErr?.message ?? "Failed to create order");
+      }
+
+      // 4. Insert order_items
+      const orderItems = cartItems.map((item) => ({
+        order_id: orderRow.id,
+        menu_item_id: item.id,
+        item_name: item.name,
+        quantity: item.qty,
+        unit_price: item.price,
+      }));
+
+      const { error: itemsErr } = await supabase
+        .from("order_items")
+        .insert(orderItems);
+
+      if (itemsErr) {
+        throw new Error(itemsErr.message);
+      }
+
+      // 5. Navigate to my-order page
+      navigate(`/my-order/${orderCode}`);
+    } catch (e: any) {
+      setError(e.message ?? "Something went wrong");
+      setSubmitting(false);
+    }
+  };
+
+  /* ─── WELCOME SCREEN ─── */
   if (step === "welcome") {
     return (
       <main className="min-h-screen bg-background flex flex-col items-center justify-center px-6 py-10">
@@ -67,22 +146,31 @@ const Seat = () => {
     );
   }
 
-  if (step === "menu") {
-    return (
-      <main className="min-h-screen bg-background flex flex-col">
-        <header className="px-6 pt-8 pb-4 flex items-center justify-between">
-          <h2 className="text-2xl">Hi {name} 👋</h2>
-          <span className="text-muted-foreground text-sm">Seat {seatId}</span>
-        </header>
+  /* ─── MENU SCREEN ─── */
+  return (
+    <main className="min-h-screen bg-background flex flex-col">
+      <header className="px-6 pt-8 pb-4 flex items-center justify-between">
+        <h2 className="text-2xl">Hi {name} 👋</h2>
+        <span className="text-muted-foreground text-sm">Seat {seatId}</span>
+      </header>
 
-        <div className="px-6">
-          <div className="inline-block border-b-2 border-primary pb-2">
-            <span className="text-primary font-semibold">Chur Chur Naan</span>
-          </div>
+      <div className="px-6">
+        <div className="inline-block border-b-2 border-primary pb-2">
+          <span className="text-primary font-semibold">Chur Chur Naan</span>
         </div>
+      </div>
 
+      {menuLoading ? (
+        <div className="flex-1 flex items-center justify-center">
+          <div className="h-10 w-10 rounded-full border-4 border-primary border-t-transparent animate-spin" />
+        </div>
+      ) : error && menu.length === 0 ? (
+        <div className="flex-1 flex items-center justify-center px-6">
+          <p className="text-destructive text-center">{error}</p>
+        </div>
+      ) : (
         <div className="flex-1 px-6 py-6 space-y-4 pb-40 overflow-y-auto">
-          {MENU.map((item) => {
+          {menu.map((item) => {
             const count = qty[item.id] ?? 0;
             return (
               <div
@@ -128,69 +216,26 @@ const Seat = () => {
             );
           })}
         </div>
+      )}
 
-        {totalCount > 0 && (
-          <div className="fixed bottom-0 left-0 right-0 bg-card shadow-[0_-2px_16px_rgba(0,0,0,0.07)] px-6 py-4 flex items-center justify-between gap-4">
-            <p className="text-foreground font-medium">
-              {totalCount} {totalCount === 1 ? "item" : "items"}
-              <span className="text-muted-foreground"> • </span>
-              ₹{totalAmount}
-            </p>
-            <Button onClick={() => setStep("confirmed")}>Place Order</Button>
-          </div>
-        )}
-      </main>
-    );
-  }
-
-  return (
-    <main className="min-h-screen bg-background flex flex-col items-center justify-center px-6 py-10">
-      <div className="w-full max-w-md flex flex-col items-center text-center space-y-6">
-        <div className="h-24 w-24 rounded-full bg-primary flex items-center justify-center">
-          <svg
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="3"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            className="h-12 w-12 text-primary-foreground"
-            aria-hidden
-          >
-            <polyline points="20 6 9 17 4 12" />
-          </svg>
+      {error && menu.length > 0 && (
+        <div className="px-6 pb-2">
+          <p className="text-destructive text-sm text-center">{error}</p>
         </div>
-        <h1 className="text-4xl">Order Placed!</h1>
-        <span className="inline-block bg-background border border-border rounded-full px-5 py-2 font-semibold text-foreground">
-          {orderId}
-        </span>
+      )}
 
-        <div className="w-full bg-card rounded-[20px] shadow-[0_2px_16px_rgba(0,0,0,0.07)] p-6 text-left space-y-4">
-          <div>
-            <p className="caption text-xs uppercase tracking-wider">Name</p>
-            <p className="font-semibold text-foreground">{name}</p>
-          </div>
-          <div className="space-y-2">
-            <p className="caption text-xs uppercase tracking-wider">Items</p>
-            {items.map((i) => (
-              <div key={i.id} className="flex justify-between text-foreground">
-                <span>
-                  {i.name} <span className="text-muted-foreground">×{i.qty}</span>
-                </span>
-                <span>₹{i.price * i.qty}</span>
-              </div>
-            ))}
-          </div>
-          <div className="border-t border-border pt-4 flex justify-between">
-            <span className="font-bold text-foreground">Total</span>
-            <span className="font-bold text-foreground">₹{totalAmount}</span>
-          </div>
+      {totalCount > 0 && (
+        <div className="fixed bottom-0 left-0 right-0 bg-card shadow-[0_-2px_16px_rgba(0,0,0,0.07)] px-6 py-4 flex items-center justify-between gap-4">
+          <p className="text-foreground font-medium">
+            {totalCount} {totalCount === 1 ? "item" : "items"}
+            <span className="text-muted-foreground"> • </span>
+            ₹{totalAmount}
+          </p>
+          <Button onClick={placeOrder} disabled={submitting}>
+            {submitting ? "Placing..." : "Place Order"}
+          </Button>
         </div>
-
-        <p className="text-muted-foreground">
-          Sit back and relax. We'll bring it to your seat.
-        </p>
-      </div>
+      )}
     </main>
   );
 };
